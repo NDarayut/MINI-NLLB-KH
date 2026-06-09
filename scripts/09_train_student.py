@@ -16,6 +16,7 @@ Key upgrades vs. the original:
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -92,7 +93,7 @@ CFG = dict(
     max_len_tokens   = 128,   # truncation length
     batch_size       = 32,    # per GPU
     grad_accum_steps = 2,     # effective batch = batch_size * world * grad_accum
-    epochs           = 1,
+    epochs           = 10,
     warmup_steps     = 4_000,
     peak_lr          = 3e-4,
     min_lr           = 1e-5,
@@ -474,23 +475,57 @@ def load_checkpoint(path: Path, model_raw, optimizer, scaler, device):
     return ckpt["epoch"], ckpt["global_step"], ckpt["val_loss"]
 
 
+def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:
+    """
+    Scans ckpt_dir for folders named epoch_NN and returns the one with
+    the highest N that actually contains a checkpoint.pt file.
+    Falls back to None if nothing is found.
+    """
+    candidates = []
+    for p in ckpt_dir.iterdir():
+        if not ckpt_dir.exists():
+            return None
+        if p.is_dir() and p.name.startswith("epoch_"):
+            try:
+                n = int(p.name.split("_")[1])
+                if (p / "checkpoint.pt").exists():
+                    candidates.append((n, p))
+            except (IndexError, ValueError):
+                pass
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]   # path with the highest epoch number
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
+    # ── CLI ─────────────────────────────────────────────────
+    # Parse before DDP init so all ranks see the same args.
+    parser = argparse.ArgumentParser(description="Mini NLLB trainer")
+    parser.add_argument(
+        "--extra-epochs", type=int, default=None,
+        help=(
+            "How many MORE epochs to train on top of whatever checkpoint "
+            "already exists. E.g. --extra-epochs 3 after epoch_01 trains "
+            "epochs 2, 3, 4. Omit to use CFG['epochs'] as the total target."
+        ),
+    )
+    args, _ = parser.parse_known_args()
+
     rank, world = setup_ddp()
-    cfg = CFG
+    cfg = dict(CFG)           # copy so we don't mutate the module-level dict
     cfg["world_size"] = world
 
     # ── reproducibility ─────────────────────────────────────
     random.seed(cfg["seed"] + rank)
     torch.manual_seed(cfg["seed"] + rank)
 
-    device     = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
-    amp_dtype  = torch.bfloat16   # bfloat16 is safer than float16 on RTX 40xx
-                                   # (no inf spikes, no loss scaling needed in theory,
-                                   #  but we keep the scaler for safety)
+    device    = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
+    amp_dtype = torch.bfloat16
 
     if is_main(rank):
         CKPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -518,31 +553,30 @@ def main():
     dataset = raw.map(preprocess, remove_columns=raw["train"].column_names)
     dataset.set_format(type="torch")
 
-    collate_fn = make_collate(cfg["pad_id"], cfg["bos_id"], cfg["max_len_tokens"])
-
+    collate_fn    = make_collate(cfg["pad_id"], cfg["bos_id"], cfg["max_len_tokens"])
     train_sampler = DistributedSampler(dataset["train"], shuffle=True)  if world > 1 else None
     valid_sampler = DistributedSampler(dataset["valid"], shuffle=False) if world > 1 else None
 
     train_loader = DataLoader(
         dataset["train"],
-        batch_size    = cfg["batch_size"],
-        sampler       = train_sampler,
-        shuffle       = (train_sampler is None),
-        collate_fn    = collate_fn,
-        num_workers   = cfg["num_workers"],
-        pin_memory    = True,
-        drop_last     = True,
+        batch_size         = cfg["batch_size"],
+        sampler            = train_sampler,
+        shuffle            = (train_sampler is None),
+        collate_fn         = collate_fn,
+        num_workers        = cfg["num_workers"],
+        pin_memory         = True,
+        drop_last          = True,
         persistent_workers = True,
     )
     valid_loader = DataLoader(
         dataset["valid"],
-        batch_size  = cfg["batch_size"],
-        sampler     = valid_sampler,
-        shuffle     = False,
-        collate_fn  = collate_fn,
-        num_workers = 2,
-        pin_memory  = True,
-        drop_last   = False,
+        batch_size         = cfg["batch_size"],
+        sampler            = valid_sampler,
+        shuffle            = False,
+        collate_fn         = collate_fn,
+        num_workers        = 2,
+        pin_memory         = True,
+        drop_last          = False,
         persistent_workers = True,
     )
 
@@ -563,8 +597,7 @@ def main():
         if is_main(rank):
             print("torch.compile() enabled")
 
-    model = DDP(model_raw, device_ids=[rank]) if world > 1 else model_raw
-    # For DDP, unwrap to access .generate() and save state_dict cleanly
+    model     = DDP(model_raw, device_ids=[rank]) if world > 1 else model_raw
     unwrapped = model.module if world > 1 else model_raw
 
     if is_main(rank):
@@ -576,7 +609,7 @@ def main():
 
     optimizer = AdamW(
         model.parameters(),
-        lr           = cfg["peak_lr"],   # overridden per-step by scheduler
+        lr           = cfg["peak_lr"],
         betas        = (0.9, 0.98),
         eps          = 1e-9,
         weight_decay = cfg["weight_decay"],
@@ -584,40 +617,82 @@ def main():
 
     scaler = torch.amp.GradScaler("cuda")
 
-    # ── total steps (for cosine schedule) ───────────────────
-    steps_per_epoch = len(train_loader) // cfg["grad_accum_steps"]
-    total_steps     = steps_per_epoch * cfg["epochs"]
-    if is_main(rank):
-        print(f"Steps/epoch: {steps_per_epoch}  |  Total steps: {total_steps}")
+    # ── auto-resume from latest epoch checkpoint ────────────
+    start_epoch = 0
+    global_step = 0
+    best_val    = float("inf")
 
-    # ── SANITY CHECK 1: overfit probe (rank 0 only, before DDP) ──
+    latest_ckpt = find_latest_checkpoint(CKPT_DIR)
+    if latest_ckpt is not None:
+        if is_main(rank):
+            print(f"Resuming from {latest_ckpt} …")
+        resumed_epoch, global_step, best_val = load_checkpoint(
+            latest_ckpt, unwrapped, optimizer, scaler, device
+        )
+        start_epoch = resumed_epoch + 1   # epoch N is done; start at N+1
+        if is_main(rank):
+            print(f"  Resumed at epoch {start_epoch}  |  global_step {global_step}  |  best_val {best_val:.4f}")
+    else:
+        if is_main(rank):
+            print("No checkpoint found — starting from scratch.")
+
+    # ── resolve total epoch target ───────────────────────────
+    # --extra-epochs N  →  train for N more epochs from wherever we are now
+    # no flag           →  train until CFG["epochs"] total (original behaviour)
+    if args.extra_epochs is not None:
+        total_epochs = start_epoch + args.extra_epochs
+        if is_main(rank):
+            print(f"--extra-epochs {args.extra_epochs}  →  will train epochs {start_epoch+1} … {total_epochs}")
+    else:
+        total_epochs = cfg["epochs"]
+        if is_main(rank) and start_epoch >= total_epochs:
+            print(
+                f"Already completed {start_epoch} epoch(s) which meets the "
+                f"CFG target of {total_epochs}. "
+                f"Use --extra-epochs N to train more."
+            )
+
+    if start_epoch >= total_epochs:
+        cleanup_ddp(world)
+        return
+
+    # ── recalculate schedule over the FULL intended run ─────
+    # total_steps covers the entire run (including already-done epochs) so
+    # the cosine tail lands in the right place when resuming mid-way.
+    steps_per_epoch = len(train_loader) // cfg["grad_accum_steps"]
+    total_steps     = steps_per_epoch * total_epochs
     if is_main(rank):
+        print(f"Steps/epoch: {steps_per_epoch}  |  Total steps: {total_steps}  |  Epochs left: {total_epochs - start_epoch}")
+
+    # ── SANITY CHECK 1: overfit probe (fresh starts only) ───
+    if is_main(rank) and start_epoch == 0:
         probe_batch = next(iter(train_loader))
         ok, init_loss = _check_batch_not_nan(probe_batch, unwrapped, loss_fn, device, amp_dtype)
         if not ok:
             raise RuntimeError("Initial forward pass produced NaN/Inf — check model init!")
-        print(f"[Sanity] Initial loss on random batch: {init_loss:.4f}  "
-              f"(expected ~{math.log(vocab_size):.2f} for random init)")
-
-        # Quick overfit probe — uses a *copy* of the model weights so we don't
-        # corrupt the main model before real training starts.
+        print(f"[Sanity] Initial loss: {init_loss:.4f}  (expected ~{math.log(vocab_size):.2f})")
         import copy
         probe_model = copy.deepcopy(unwrapped)
         overfit_one_batch(probe_model, probe_batch, loss_fn, device, amp_dtype, steps=60)
         del probe_model
 
-    # ── training loop ───────────────────────────────────────
-    best_val   = float("inf")
-    global_step = 0
-    log_rows    = []
+    # ── load existing log so we append rather than overwrite ─
+    log_rows: list[dict] = []
+    if LOG_FILE.exists():
+        with open(LOG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    log_rows.append(json.loads(line))
 
-    for epoch in range(cfg["epochs"]):
+    # ── training loop ───────────────────────────────────────
+    for epoch in range(start_epoch, total_epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         if is_main(rank):
             print(f"\n{'='*60}")
-            print(f"EPOCH {epoch + 1} / {cfg['epochs']}")
+            print(f"EPOCH {epoch + 1} / {total_epochs}")
             print(f"{'='*60}")
 
         train_loss, global_step = train_one_epoch(
@@ -656,7 +731,8 @@ def main():
 
             # ── JSON training log ─────────────────────────────
             log_rows.append({
-                "epoch": epoch + 1, "step": global_step,
+                "epoch":      epoch + 1,
+                "step":       global_step,
                 "train_loss": round(train_loss, 5),
                 "val_loss":   round(val_loss,   5),
             })
@@ -668,6 +744,8 @@ def main():
 
 
 if __name__ == "__main__":
-    # Single GPU:   python train.py
-    # Dual GPU:     torchrun --nproc_per_node=2 09_train_student.py
+    # Fresh start, single GPU:    python 09_train_student.py
+    # Fresh start, dual GPU:      torchrun --nproc_per_node=2 09_train_student.py
+    # Resume + 3 more epochs:     python 09_train_student.py --extra-epochs 3
+    # Resume + 3 more, dual GPU:  torchrun --nproc_per_node=2 09_train_student.py --extra-epochs 3
     main()
