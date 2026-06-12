@@ -112,7 +112,7 @@ CFG = dict(
     compile_model      = True,   # torch.compile — set False if PyTorch < 2.0
     log_every          = 50,     # steps
     sample_every_epoch = True,   # print translation samples after each epoch
-    n_samples          = 3,      # how many validation sentences to translate
+    n_samples          = 10,      # how many validation sentences to translate
 )
 
 
@@ -783,5 +783,5 @@ if __name__ == "__main__":
     # Fresh start, single GPU:    python train.py
     # Fresh start, dual GPU:      torchrun --nproc_per_node=2 train.py
     # Resume + 3 more epochs:     python train.py --extra-epochs 3
-    # Resume + 3 more, dual GPU:  torchrun --nproc_per_node=2 train.py --extra-epochs 3
+    # Resume + 3 more, dual GPU:  torchrun --nproc_per_node=2 09_train_student.py --extra-epochs 3
     main()
