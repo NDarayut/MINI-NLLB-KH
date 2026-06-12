@@ -232,3 +232,5 @@ checkpoints/
 checkpoints
 
 checkpoints_distill
+
+checkpoints_human_finetune

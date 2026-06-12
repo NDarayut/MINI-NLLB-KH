@@ -131,7 +131,7 @@ CFG = dict(
     # distillation weights to human-data fine-tuning. After the first
     # successful run on this dataset, set to False so further
     # --extra-epochs calls continue the schedule normally.
-    reset_schedule     = True,
+    reset_schedule     = False,
 )
 
 
